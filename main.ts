@@ -1,7 +1,7 @@
 /**
  * AI API Proxy - Deno Deploy
  *
- * A secure proxy for Anthropic Claude, Google Gemini, and Supabase APIs.
+ * A secure proxy for Anthropic Claude, Google Gemini, Supabase, and Upstash Redis.
  * Keeps API keys server-side, adds rate limiting and CORS support.
  *
  * Endpoints:
@@ -12,13 +12,20 @@
  *   POST /api/stress-test            - Analyze name for teasing potential
  *   POST /api/check-availability     - Check social handle availability
  *   POST /api/supabase/*             - Proxy to Supabase (uses service_role key)
+ *   POST /api/cache/get              - Get value from Redis cache
+ *   POST /api/cache/set              - Set value in Redis cache
+ *   POST /api/cache/del              - Delete key from Redis cache
+ *   POST /api/cache/mget             - Get multiple values from Redis
+ *   GET  /api/cache/health           - Redis health check
  *   GET  /health                     - Health check
  *
  * Environment variables (set in Deno Deploy dashboard):
- *   ANTHROPIC_API_KEY     - Your Anthropic API key
- *   GEMINI_API_KEY        - Your Google Gemini API key
- *   SUPABASE_URL          - Your Supabase project URL
- *   SUPABASE_SERVICE_KEY  - Your Supabase service_role key (NOT anon key)
+ *   ANTHROPIC_API_KEY           - Your Anthropic API key
+ *   GEMINI_API_KEY              - Your Google Gemini API key
+ *   SUPABASE_URL                - Your Supabase project URL
+ *   SUPABASE_SERVICE_KEY        - Your Supabase service_role key (NOT anon key)
+ *   UPSTASH_REDIS_REST_URL      - Your Upstash Redis REST URL
+ *   UPSTASH_REDIS_REST_TOKEN    - Your Upstash Redis REST token (full access)
  */
 
 // CORS headers for cross-origin requests
@@ -29,25 +36,61 @@ const corsHeaders: Record<string, string> = {
   "Access-Control-Max-Age": "86400",
 };
 
-// Simple in-memory rate limiting
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_RPM = 60;
+// Deno KV for distributed rate limiting
+const kv = await Deno.openKv();
+const RATE_LIMIT_MAX = 60;
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
 
-function checkRateLimit(ip: string): boolean {
+interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetTime: number;
+}
+
+async function checkRateLimit(ip: string): Promise<RateLimitResult> {
+  const key = ["ratelimit", ip];
   const now = Date.now();
-  const record = rateLimitMap.get(ip);
 
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + 60000 });
-    return true;
+  const entry = await kv.get<{ count: number; windowStart: number }>(key);
+
+  if (!entry.value || now - entry.value.windowStart > RATE_LIMIT_WINDOW_MS) {
+    const windowStart = now;
+    await kv.set(key, { count: 1, windowStart }, { expireIn: RATE_LIMIT_WINDOW_MS });
+    return {
+      allowed: true,
+      remaining: RATE_LIMIT_MAX - 1,
+      resetTime: windowStart + RATE_LIMIT_WINDOW_MS,
+    };
   }
 
-  if (record.count >= RATE_LIMIT_RPM) {
-    return false;
+  if (entry.value.count >= RATE_LIMIT_MAX) {
+    return {
+      allowed: false,
+      remaining: 0,
+      resetTime: entry.value.windowStart + RATE_LIMIT_WINDOW_MS,
+    };
   }
 
-  record.count++;
-  return true;
+  const newCount = entry.value.count + 1;
+  await kv.set(
+    key,
+    { count: newCount, windowStart: entry.value.windowStart },
+    { expireIn: RATE_LIMIT_WINDOW_MS - (now - entry.value.windowStart) }
+  );
+
+  return {
+    allowed: true,
+    remaining: RATE_LIMIT_MAX - newCount,
+    resetTime: entry.value.windowStart + RATE_LIMIT_WINDOW_MS,
+  };
+}
+
+function getRateLimitHeaders(rateLimitResult: RateLimitResult): Record<string, string> {
+  return {
+    "X-RateLimit-Limit": String(RATE_LIMIT_MAX),
+    "X-RateLimit-Remaining": String(rateLimitResult.remaining),
+    "X-RateLimit-Reset": String(Math.ceil(rateLimitResult.resetTime / 1000)),
+  };
 }
 
 // Handle OPTIONS preflight requests
@@ -68,6 +111,7 @@ function handleHealth(): Response {
         anthropic: !!Deno.env.get("ANTHROPIC_API_KEY"),
         gemini: !!Deno.env.get("GEMINI_API_KEY"),
         supabase: !!Deno.env.get("SUPABASE_URL") && !!Deno.env.get("SUPABASE_SERVICE_KEY"),
+        redis: !!Deno.env.get("UPSTASH_REDIS_REST_URL") && !!Deno.env.get("UPSTASH_REDIS_REST_TOKEN"),
       }
     }),
     {
@@ -164,7 +208,7 @@ When suggesting names, output JSON at the end of your response in this format:
 
 End with a gentle question OR invitation to react.`;
 
-async function handleChat(request: Request): Promise<Response> {
+async function handleChat(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json();
     const { messages, context } = body;
@@ -180,7 +224,7 @@ async function handleChat(request: Request): Promise<Response> {
     if (result.error) {
       return new Response(
         JSON.stringify({ error: result.error }),
-        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
       );
     }
 
@@ -204,13 +248,13 @@ async function handleChat(request: Request): Promise<Response> {
         content: cleanContent,
         suggestedNames
       }),
-      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ error: "Chat error", details: message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 }
@@ -232,7 +276,7 @@ Output ONLY valid JSON in this exact format:
   ]
 }`;
 
-async function handleGenerateNames(request: Request): Promise<Response> {
+async function handleGenerateNames(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json();
     const { preferences, count = 5 } = body;
@@ -249,7 +293,7 @@ async function handleGenerateNames(request: Request): Promise<Response> {
     if (result.error) {
       return new Response(
         JSON.stringify({ error: result.error }),
-        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
       );
     }
 
@@ -269,13 +313,13 @@ async function handleGenerateNames(request: Request): Promise<Response> {
 
     return new Response(
       JSON.stringify({ names }),
-      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ error: "Generate names error", details: message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 }
@@ -301,7 +345,7 @@ Be honest but constructive. Output ONLY valid JSON:
   "positiveNotes": ["positive aspect 1", "positive aspect 2"]
 }`;
 
-async function handleStressTest(request: Request): Promise<Response> {
+async function handleStressTest(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json();
     const { firstName, lastName } = body;
@@ -309,7 +353,7 @@ async function handleStressTest(request: Request): Promise<Response> {
     if (!firstName) {
       return new Response(
         JSON.stringify({ error: "firstName is required" }),
-        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
       );
     }
 
@@ -325,7 +369,7 @@ async function handleStressTest(request: Request): Promise<Response> {
     if (result.error) {
       return new Response(
         JSON.stringify({ error: result.error }),
-        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
       );
     }
 
@@ -336,7 +380,7 @@ async function handleStressTest(request: Request): Promise<Response> {
         const parsed = JSON.parse(jsonMatch[0]);
         return new Response(
           JSON.stringify(parsed),
-          { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
         );
       }
     } catch {
@@ -352,20 +396,20 @@ async function handleStressTest(request: Request): Promise<Response> {
         mitigations: [],
         positiveNotes: ["Name appears unremarkable from a teasing perspective"]
       }),
-      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ error: "Stress test error", details: message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 }
 
 // Note: Real availability checking would require actual API calls to platforms
 // This provides a simulated response for demo purposes
-async function handleCheckAvailability(request: Request): Promise<Response> {
+async function handleCheckAvailability(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   try {
     const body = await request.json();
     const { name, checkTypes = ["instagram", "tiktok", "domain"] } = body;
@@ -373,7 +417,7 @@ async function handleCheckAvailability(request: Request): Promise<Response> {
     if (!name) {
       return new Response(
         JSON.stringify({ error: "name is required" }),
-        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
       );
     }
 
@@ -405,27 +449,27 @@ async function handleCheckAvailability(request: Request): Promise<Response> {
 
     return new Response(
       JSON.stringify(result),
-      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ error: "Availability check error", details: message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 }
 
 // ============ Supabase Proxy ============
 
-async function handleSupabase(request: Request, url: URL): Promise<Response> {
+async function handleSupabase(request: Request, url: URL, rateLimitHeaders: Record<string, string>): Promise<Response> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_KEY");
 
   if (!supabaseUrl || !serviceKey) {
     return new Response(
       JSON.stringify({ error: "Supabase not configured" }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 
@@ -468,7 +512,276 @@ async function handleSupabase(request: Request, url: URL): Promise<Response> {
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ error: "Supabase proxy error", details: message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+// ============ Redis Cache Proxy ============
+
+/**
+ * Helper to call Upstash Redis REST API
+ */
+async function callRedis(
+  command: string[],
+  rateLimitHeaders: Record<string, string>
+): Promise<Response> {
+  const redisUrl = Deno.env.get("UPSTASH_REDIS_REST_URL");
+  const redisToken = Deno.env.get("UPSTASH_REDIS_REST_TOKEN");
+
+  if (!redisUrl || !redisToken) {
+    return new Response(
+      JSON.stringify({ error: "Redis not configured" }),
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+
+  try {
+    const response = await fetch(redisUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${redisToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(command),
+    });
+
+    const data = await response.json();
+    return new Response(
+      JSON.stringify(data),
+      { status: response.ok ? 200 : 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Redis error", details: message }),
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * GET /api/cache/health - Redis health check with latency
+ */
+async function handleCacheHealth(rateLimitHeaders: Record<string, string>): Promise<Response> {
+  const redisUrl = Deno.env.get("UPSTASH_REDIS_REST_URL");
+  const redisToken = Deno.env.get("UPSTASH_REDIS_REST_TOKEN");
+
+  if (!redisUrl || !redisToken) {
+    return new Response(
+      JSON.stringify({ available: false, configured: false, latencyMs: null, error: "Redis not configured" }),
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+
+  try {
+    const start = Date.now();
+    const response = await fetch(redisUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${redisToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["PING"]),
+    });
+
+    const latencyMs = Date.now() - start;
+    const data = await response.json();
+
+    return new Response(
+      JSON.stringify({
+        available: data.result === "PONG",
+        configured: true,
+        latencyMs,
+        error: null,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ available: false, configured: true, latencyMs: null, error: message }),
+      { status: 200, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/get - Get a value from cache
+ * Body: { key: string }
+ */
+async function handleCacheGet(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  try {
+    const { key } = await request.json();
+    if (!key || typeof key !== "string") {
+      return new Response(
+        JSON.stringify({ error: "key is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+    return callRedis(["GET", key], rateLimitHeaders);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Invalid request", details: message }),
+      { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/set - Set a value in cache with TTL
+ * Body: { key: string, value: any, ttl?: number }
+ */
+async function handleCacheSet(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  try {
+    const { key, value, ttl } = await request.json();
+    if (!key || typeof key !== "string") {
+      return new Response(
+        JSON.stringify({ error: "key is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+    if (value === undefined) {
+      return new Response(
+        JSON.stringify({ error: "value is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+
+    // Serialize value to JSON string for storage
+    const serialized = JSON.stringify(value);
+
+    if (ttl && typeof ttl === "number" && ttl > 0) {
+      return callRedis(["SETEX", key, String(ttl), serialized], rateLimitHeaders);
+    } else {
+      return callRedis(["SET", key, serialized], rateLimitHeaders);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Invalid request", details: message }),
+      { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/del - Delete a key from cache
+ * Body: { key: string } or { keys: string[] }
+ */
+async function handleCacheDel(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  try {
+    const body = await request.json();
+    const keys = body.keys || (body.key ? [body.key] : []);
+
+    if (!Array.isArray(keys) || keys.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "key or keys is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+
+    return callRedis(["DEL", ...keys], rateLimitHeaders);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Invalid request", details: message }),
+      { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/mget - Get multiple values from cache
+ * Body: { keys: string[] }
+ */
+async function handleCacheMget(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  try {
+    const { keys } = await request.json();
+    if (!Array.isArray(keys) || keys.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "keys array is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+    return callRedis(["MGET", ...keys], rateLimitHeaders);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Invalid request", details: message }),
+      { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/scan - Scan keys by pattern (for invalidation)
+ * Body: { pattern: string, cursor?: number, count?: number }
+ */
+async function handleCacheScan(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  try {
+    const { pattern, cursor = 0, count = 100 } = await request.json();
+    if (!pattern || typeof pattern !== "string") {
+      return new Response(
+        JSON.stringify({ error: "pattern is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+    return callRedis(["SCAN", String(cursor), "MATCH", pattern, "COUNT", String(count)], rateLimitHeaders);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Invalid request", details: message }),
+      { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+}
+
+/**
+ * POST /api/cache/pipeline - Execute multiple commands in a pipeline
+ * Body: { commands: string[][] }
+ */
+async function handleCachePipeline(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
+  const redisUrl = Deno.env.get("UPSTASH_REDIS_REST_URL");
+  const redisToken = Deno.env.get("UPSTASH_REDIS_REST_TOKEN");
+
+  if (!redisUrl || !redisToken) {
+    return new Response(
+      JSON.stringify({ error: "Redis not configured" }),
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  }
+
+  try {
+    const { commands } = await request.json();
+    if (!Array.isArray(commands) || commands.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "commands array is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+      );
+    }
+
+    // Use Upstash pipeline endpoint
+    const response = await fetch(`${redisUrl}/pipeline`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${redisToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(commands),
+    });
+
+    const data = await response.json();
+    return new Response(
+      JSON.stringify(data),
+      { status: response.ok ? 200 : 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return new Response(
+      JSON.stringify({ error: "Pipeline error", details: message }),
+      { status: 500, headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders } }
     );
   }
 }
@@ -476,7 +789,7 @@ async function handleSupabase(request: Request, url: URL): Promise<Response> {
 // ============ Original Anthropic/Gemini Handlers ============
 
 // Proxy request to Anthropic Claude API
-async function handleAnthropic(request: Request): Promise<Response> {
+async function handleAnthropic(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
 
   if (!apiKey) {
@@ -484,7 +797,7 @@ async function handleAnthropic(request: Request): Promise<Response> {
       JSON.stringify({ error: "Anthropic API key not configured" }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
@@ -519,7 +832,7 @@ async function handleAnthropic(request: Request): Promise<Response> {
     const data = await response.json();
     return new Response(JSON.stringify(data), {
       status: response.status,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
+      headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -527,7 +840,7 @@ async function handleAnthropic(request: Request): Promise<Response> {
       JSON.stringify({ error: "Proxy error", details: message }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
@@ -536,7 +849,8 @@ async function handleAnthropic(request: Request): Promise<Response> {
 // Proxy request to Google Gemini API
 async function handleGemini(
   request: Request,
-  url: URL
+  url: URL,
+  rateLimitHeaders: Record<string, string>
 ): Promise<Response> {
   const apiKey = Deno.env.get("GEMINI_API_KEY");
 
@@ -545,7 +859,7 @@ async function handleGemini(
       JSON.stringify({ error: "Gemini API key not configured" }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
@@ -587,7 +901,7 @@ async function handleGemini(
     const data = await response.json();
     return new Response(JSON.stringify(data), {
       status: response.status,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
+      headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -595,14 +909,14 @@ async function handleGemini(
       JSON.stringify({ error: "Proxy error", details: message }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
 }
 
 // Simple Gemini endpoint
-async function handleGeminiSimple(request: Request): Promise<Response> {
+async function handleGeminiSimple(request: Request, rateLimitHeaders: Record<string, string>): Promise<Response> {
   const apiKey = Deno.env.get("GEMINI_API_KEY");
 
   if (!apiKey) {
@@ -610,7 +924,7 @@ async function handleGeminiSimple(request: Request): Promise<Response> {
       JSON.stringify({ error: "Gemini API key not configured" }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
@@ -631,7 +945,7 @@ async function handleGeminiSimple(request: Request): Promise<Response> {
     const data = await response.json();
     return new Response(JSON.stringify(data), {
       status: response.status,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
+      headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -639,7 +953,7 @@ async function handleGeminiSimple(request: Request): Promise<Response> {
       JSON.stringify({ error: "Proxy error", details: message }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
+        headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
       }
     );
   }
@@ -666,28 +980,37 @@ async function handler(request: Request): Promise<Response> {
     request.headers.get("cf-connecting-ip") ||
     "unknown";
 
-  if (!checkRateLimit(clientIP)) {
+  const rateLimitResult = await checkRateLimit(clientIP);
+  const rateLimitHeaders = getRateLimitHeaders(rateLimitResult);
+
+  if (!rateLimitResult.allowed) {
     return new Response(
       JSON.stringify({
         error: "Rate limit exceeded",
-        message: `Maximum ${RATE_LIMIT_RPM} requests per minute`,
+        message: `Maximum ${RATE_LIMIT_MAX} requests per minute`,
       }),
       {
         status: 429,
         headers: {
           "Content-Type": "application/json",
-          "Retry-After": "60",
+          "Retry-After": String(Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000)),
+          ...rateLimitHeaders,
           ...corsHeaders,
         },
       }
     );
   }
 
+  // Cache health check is GET (separate handling before POST check)
+  if (path === "/api/cache/health" && request.method === "GET") {
+    return handleCacheHealth(rateLimitHeaders);
+  }
+
   // Only allow POST for API endpoints (except Supabase which can be GET/PATCH/DELETE)
   if (request.method !== "POST" && !path.startsWith("/api/supabase")) {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
       status: 405,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
+      headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
     });
   }
 
@@ -695,37 +1018,62 @@ async function handler(request: Request): Promise<Response> {
 
   // Baby Names specific endpoints
   if (path === "/api/chat") {
-    return handleChat(request);
+    return handleChat(request, rateLimitHeaders);
   }
 
   if (path === "/api/generate-names") {
-    return handleGenerateNames(request);
+    return handleGenerateNames(request, rateLimitHeaders);
   }
 
   if (path === "/api/stress-test") {
-    return handleStressTest(request);
+    return handleStressTest(request, rateLimitHeaders);
   }
 
   if (path === "/api/check-availability") {
-    return handleCheckAvailability(request);
+    return handleCheckAvailability(request, rateLimitHeaders);
+  }
+
+  // Redis cache proxy endpoints
+  if (path === "/api/cache/get") {
+    return handleCacheGet(request, rateLimitHeaders);
+  }
+
+  if (path === "/api/cache/set") {
+    return handleCacheSet(request, rateLimitHeaders);
+  }
+
+  if (path === "/api/cache/del") {
+    return handleCacheDel(request, rateLimitHeaders);
+  }
+
+  if (path === "/api/cache/mget") {
+    return handleCacheMget(request, rateLimitHeaders);
+  }
+
+  if (path === "/api/cache/scan") {
+    return handleCacheScan(request, rateLimitHeaders);
+  }
+
+  if (path === "/api/cache/pipeline") {
+    return handleCachePipeline(request, rateLimitHeaders);
   }
 
   // Supabase proxy
   if (path.startsWith("/api/supabase")) {
-    return handleSupabase(request, url);
+    return handleSupabase(request, url, rateLimitHeaders);
   }
 
   // Original AI proxy endpoints
   if (path === "/api/anthropic/messages" || path.startsWith("/api/anthropic/")) {
-    return handleAnthropic(request);
+    return handleAnthropic(request, rateLimitHeaders);
   }
 
   if (path === "/api/gemini/generate" || path === "/api/gemini") {
-    return handleGeminiSimple(request);
+    return handleGeminiSimple(request, rateLimitHeaders);
   }
 
   if (path.startsWith("/api/gemini/models/")) {
-    return handleGemini(request, url);
+    return handleGemini(request, url, rateLimitHeaders);
   }
 
   // 404 for unknown routes
@@ -737,6 +1085,13 @@ async function handler(request: Request): Promise<Response> {
         "POST /api/generate-names         - Generate name suggestions",
         "POST /api/stress-test            - Analyze teasing potential",
         "POST /api/check-availability     - Check handle availability",
+        "POST /api/cache/get              - Get cached value",
+        "POST /api/cache/set              - Set cached value with TTL",
+        "POST /api/cache/del              - Delete cached key(s)",
+        "POST /api/cache/mget             - Get multiple cached values",
+        "POST /api/cache/scan             - Scan keys by pattern",
+        "POST /api/cache/pipeline         - Execute pipeline commands",
+        "GET  /api/cache/health           - Redis health check",
         "POST /api/supabase/*             - Supabase proxy",
         "POST /api/anthropic/messages     - Claude API proxy",
         "POST /api/gemini/generate        - Gemini API proxy",
@@ -745,7 +1100,7 @@ async function handler(request: Request): Promise<Response> {
     }),
     {
       status: 404,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
+      headers: { "Content-Type": "application/json", ...rateLimitHeaders, ...corsHeaders },
     }
   );
 }

@@ -5,5 +5,13 @@
   },
   "compilerOptions": {
     "strict": true
+  },
+  "deploy": {
+    "project": "25327aba-4f3d-4dda-97f5-c34de524d18e",
+    "exclude": [
+      "**/node_modules"
+    ],
+    "include": [],
+    "entrypoint": "main.ts"
   }
 }
